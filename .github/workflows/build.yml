@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Montar projeto a partir dos zips
         run: |
           mkdir proj
           for z in projeto-*.zip; do unzip -q -o "$z" -d proj; done
           ls proj proj/app/src/main/assets/www | head -20
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
