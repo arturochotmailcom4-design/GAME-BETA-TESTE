@@ -10,8 +10,12 @@ jobs:
       - name: Montar projeto a partir dos zips
         run: |
           mkdir proj
-          for z in projeto-*.zip; do unzip -q -o "$z" -d proj; done
+          for z in projeto-*.zip; do [ -f "$z" ] && unzip -q -o "$z" -d proj; done
+          # jogo atualizado: os 12 zips NewJazz_XX_de_12.zip vão para a pasta www
+          mkdir -p proj/app/src/main/assets/www
+          for z in NewJazz_*_de_*.zip; do [ -f "$z" ] && unzip -q -o "$z" -d proj/app/src/main/assets/www; done
           ls proj proj/app/src/main/assets/www | head -20
+          echo "imagens: $(ls proj/app/src/main/assets/www/a | wc -l) · radio: $(ls proj/app/src/main/assets/www/radio 2>/dev/null | wc -l)"
       - name: Corrigir MainActivity
         run: |
           cat > proj/app/src/main/java/com/newjazz/app/MainActivity.java <<'EOF'
