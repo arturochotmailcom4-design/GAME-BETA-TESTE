@@ -1,4 +1,3 @@
-
 name: Gerar APK
 on:
   push:
@@ -12,7 +11,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
- 
+
       - name: Baixar o jogo da Release "jogo"
         env:
           GH_TOKEN: ${{ github.token }}
@@ -26,12 +25,12 @@ jobs:
             echo "::error::Nao achei o NewJazz_completo.zip. Crie uma Release (tag jogo ou game) e anexe o zip."
             exit 1
           fi
- 
+
       - name: Criar o projeto Android
         run: |
           mkdir -p proj/app/src/main/java/com/newjazz/app proj/app/src/main/assets/www proj/app/src/main/res/drawable proj/app/src/main/res/values
           cd proj
- 
+
           cat > settings.gradle <<'EOF'
           pluginManagement {
             repositories { google(); mavenCentral(); gradlePluginPortal() }
@@ -42,16 +41,17 @@ jobs:
           rootProject.name = "NewJazz"
           include ':app'
           EOF
- 
+
           cat > build.gradle <<'EOF'
           plugins { id 'com.android.application' version '8.5.2' apply false }
           EOF
- 
+
           cat > gradle.properties <<'EOF'
           org.gradle.jvmargs=-Xmx3g
           android.nonTransitiveRClass=true
+          android.useAndroidX=true
           EOF
- 
+
           cat > app/build.gradle <<'EOF'
           plugins { id 'com.android.application' }
           android {
@@ -61,8 +61,8 @@ jobs:
               applicationId 'com.newjazz.app'
               minSdk 24
               targetSdk 34
-              versionCode 487
-              versionName '487'
+              versionCode 488
+              versionName '488'
             }
             compileOptions {
               sourceCompatibility JavaVersion.VERSION_17
@@ -70,8 +70,13 @@ jobs:
             }
             androidResources { noCompress += ['mp3', 'webp'] }
           }
+          dependencies {
+            implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')
+            implementation 'com.google.android.gms:play-services-cast-framework:21.3.0'
+            implementation 'androidx.mediarouter:mediarouter:1.6.0'
+          }
           EOF
- 
+
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -85,6 +90,9 @@ jobs:
               android:largeHeap="true"
               android:usesCleartextTraffic="true"
               android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+              <meta-data
+                android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
+                android:value="com.newjazz.app.CastOptionsProvider" />
               <activity
                 android:name=".MainActivity"
                 android:exported="true"
@@ -97,10 +105,10 @@ jobs:
             </application>
           </manifest>
           EOF
- 
+
           cat > app/src/main/java/com/newjazz/app/MainActivity.java <<'EOF'
           package com.newjazz.app;
- 
+
           import android.app.Activity;
           import android.content.Intent;
           import android.net.Uri;
@@ -110,13 +118,141 @@ jobs:
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
+          import androidx.mediarouter.media.MediaRouteSelector;
+          import androidx.mediarouter.media.MediaRouter;
+          import com.google.android.gms.cast.CastDevice;
+          import com.google.android.gms.cast.CastMediaControlIntent;
+          import com.google.android.gms.cast.framework.CastContext;
+          import com.google.android.gms.cast.framework.CastSession;
+          import com.google.android.gms.cast.framework.SessionManagerListener;
           import java.util.List;
- 
+
           public class MainActivity extends Activity {
             WebView w;
             static LanServer lan;
             static final int LAN_PORT = 8380;
- 
+            static final String NS = "urn:x-cast:com.newjazz.tv";
+
+            /* ---------- Chromecast ---------- */
+            CastContext castCtx;
+            MediaRouter mr;
+            MediaRouteSelector sel;
+            CastSession cs;
+            volatile String castSt = "", castName = "", castErr = "";
+            boolean scanning;
+
+            void js(final String ev) {
+              runOnUiThread(() -> { if (w != null) w.evaluateJavascript("window.njCastEv&&window.njCastEv(" + ev + ")", null); });
+            }
+
+            void state(String st, CastSession s) {
+              castSt = st;
+              try { CastDevice d = s == null ? null : s.getCastDevice(); if (d != null) castName = d.getFriendlyName(); } catch (Exception e) {}
+              js("{\"k\":\"state\",\"st\":" + LanServer.Json.str(st) + ",\"name\":" + LanServer.Json.str(castName == null ? "" : castName) + "}");
+            }
+
+            /* roda na thread principal */
+            boolean castInit() {
+              if (castCtx != null) return true;
+              String id = CastOptionsProvider.appId(this);
+              if (id.isEmpty()) { castErr = "semid"; return false; }
+              try {
+                castCtx = CastContext.getSharedInstance(this);
+              } catch (Exception e) {
+                castErr = "semplay";
+                return false;
+              }
+              sel = castCtx.getMergedSelector();
+              if (sel == null) sel = new MediaRouteSelector.Builder().addControlCategory(CastMediaControlIntent.categoryForCast(id)).build();
+              mr = MediaRouter.getInstance(this);
+              castCtx.getSessionManager().addSessionManagerListener(sml, CastSession.class);
+              CastSession cur = castCtx.getSessionManager().getCurrentCastSession();
+              if (cur != null && cur.isConnected()) castOn(cur);
+              castErr = "";
+              return true;
+            }
+
+            void castOn(CastSession s) {
+              cs = s;
+              try {
+                s.setMessageReceivedCallbacks(NS, (dev, ns, msg) -> js("{\"k\":\"msg\",\"m\":" + LanServer.Json.str(msg) + "}"));
+              } catch (Exception e) {}
+              state("ligado", s);
+            }
+
+            void pushRoutes() {
+              if (mr == null || sel == null) return;
+              StringBuilder sb = new StringBuilder("{\"k\":\"routes\",\"list\":[");
+              boolean first = true;
+              for (MediaRouter.RouteInfo r : mr.getRoutes()) {
+                if (r.isDefault() || !r.isEnabled() || !r.matchesSelector(sel)) continue;
+                if (!first) sb.append(',');
+                first = false;
+                sb.append("{\"id\":").append(LanServer.Json.str(r.getId())).append(",\"name\":").append(LanServer.Json.str(String.valueOf(r.getName()))).append('}');
+              }
+              js(sb.append("]}").toString());
+            }
+
+            final MediaRouter.Callback mrcb = new MediaRouter.Callback() {
+              @Override public void onRouteAdded(MediaRouter router, MediaRouter.RouteInfo route) { pushRoutes(); }
+              @Override public void onRouteRemoved(MediaRouter router, MediaRouter.RouteInfo route) { pushRoutes(); }
+              @Override public void onRouteChanged(MediaRouter router, MediaRouter.RouteInfo route) { pushRoutes(); }
+            };
+
+            final SessionManagerListener<CastSession> sml = new SessionManagerListener<CastSession>() {
+              @Override public void onSessionStarting(CastSession s) { state("conectando", s); }
+              @Override public void onSessionStarted(CastSession s, String id) { castOn(s); }
+              @Override public void onSessionStartFailed(CastSession s, int err) { cs = null; state("falhou:" + err, null); }
+              @Override public void onSessionEnding(CastSession s) {}
+              @Override public void onSessionEnded(CastSession s, int err) { cs = null; state("fim", null); }
+              @Override public void onSessionResuming(CastSession s, String id) { state("conectando", s); }
+              @Override public void onSessionResumed(CastSession s, boolean wasSuspended) { castOn(s); }
+              @Override public void onSessionResumeFailed(CastSession s, int err) { cs = null; state("fim", null); }
+              @Override public void onSessionSuspended(CastSession s, int reason) { state("conectando", s); }
+            };
+
+            /* ponte do jogo: window.NJCast */
+            class CastBridge {
+              @JavascriptInterface
+              public String status() {
+                boolean id = !CastOptionsProvider.appId(MainActivity.this).isEmpty();
+                return "{\"id\":" + id + ",\"st\":" + LanServer.Json.str(castSt) + ",\"name\":" + LanServer.Json.str(castName == null ? "" : castName)
+                    + ",\"err\":" + LanServer.Json.str(castErr) + "}";
+              }
+
+              @JavascriptInterface
+              public void scan(final boolean on) {
+                runOnUiThread(() -> {
+                  if (!castInit()) { js("{\"k\":\"state\",\"st\":\"\",\"err\":" + LanServer.Json.str(castErr) + "}"); return; }
+                  if (on && !scanning) { mr.addCallback(sel, mrcb, MediaRouter.CALLBACK_FLAG_PERFORM_ACTIVE_SCAN); scanning = true; }
+                  else if (!on && scanning) { mr.removeCallback(mrcb); scanning = false; }
+                  pushRoutes();
+                });
+              }
+
+              @JavascriptInterface
+              public void select(final String id) {
+                runOnUiThread(() -> {
+                  if (!castInit()) return;
+                  for (MediaRouter.RouteInfo r : mr.getRoutes()) {
+                    if (r.getId().equals(id)) { state("conectando", null); r.select(); return; }
+                  }
+                });
+              }
+
+              @JavascriptInterface
+              public void stop() {
+                runOnUiThread(() -> { if (castCtx != null) castCtx.getSessionManager().endCurrentSession(true); });
+              }
+
+              @JavascriptInterface
+              public void send(final String m) {
+                runOnUiThread(() -> {
+                  try { if (cs != null && cs.isConnected()) cs.sendMessage(NS, m); } catch (Exception e) {}
+                });
+              }
+            }
+
             /* ponte do jogo: window.NJLocal.start() / stop() / info() */
             class Bridge {
               @JavascriptInterface
@@ -130,16 +266,16 @@ jobs:
                   return "{\"ok\":false,\"err\":" + LanServer.Json.str(String.valueOf(e.getMessage())) + "}";
                 }
               }
- 
+
               @JavascriptInterface
               public void stop() {
                 if (lan != null) lan.stop();
                 runOnUiThread(() -> getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON));
               }
- 
+
               @JavascriptInterface
               public String info() { return info(lan != null && lan.running()); }
- 
+
               String info(boolean ok) {
                 StringBuilder sb = new StringBuilder("{\"ok\":").append(ok).append(",\"on\":").append(lan != null && lan.running());
                 sb.append(",\"port\":").append(LAN_PORT).append(",\"n\":").append(lan == null ? 0 : lan.clients()).append(",\"ips\":[");
@@ -148,7 +284,7 @@ jobs:
                 return sb.append("]}").toString();
               }
             }
- 
+
             @Override
             protected void onCreate(Bundle b) {
               super.onCreate(b);
@@ -162,6 +298,7 @@ jobs:
               s.setAllowUniversalAccessFromFileURLs(true);
               s.setMediaPlaybackRequiresUserGesture(false);
               w.addJavascriptInterface(new Bridge(), "NJLocal");
+              w.addJavascriptInterface(new CastBridge(), "NJCast");
               w.setWebViewClient(new WebViewClient() {
                 @Override
                 public boolean shouldOverrideUrlLoading(WebView v, String u) {
@@ -176,63 +313,103 @@ jobs:
               w.loadUrl("file:///android_asset/www/index.html");
               hide();
             }
- 
+
             void hide() {
               getWindow().getDecorView().setSystemUiVisibility(4 | 2 | 4096 | 1024 | 512 | 256);
             }
- 
+
             @Override
             public void onWindowFocusChanged(boolean f) {
               super.onWindowFocusChanged(f);
               if (f) hide();
             }
- 
+
             @Override
             public void onBackPressed() {
               if (w.canGoBack()) w.goBack(); else super.onBackPressed();
             }
- 
+
             @Override
             protected void onPause() { super.onPause(); w.onPause(); }
- 
+
             @Override
             protected void onResume() { super.onResume(); w.onResume(); }
- 
+
             @Override
             protected void onDestroy() {
+              if (mr != null && scanning) { mr.removeCallback(mrcb); scanning = false; }
+              if (castCtx != null) castCtx.getSessionManager().removeSessionManagerListener(sml, CastSession.class);
               if (isFinishing() && lan != null) { lan.stop(); lan = null; }
               super.onDestroy();
             }
           }
           EOF
- 
+
+          # Chromecast: App ID lido de assets/cast_app.txt
+          cat > app/src/main/java/com/newjazz/app/CastOptionsProvider.java <<'EOF'
+          package com.newjazz.app;
+
+          import android.content.Context;
+          import com.google.android.gms.cast.framework.CastOptions;
+          import com.google.android.gms.cast.framework.OptionsProvider;
+          import com.google.android.gms.cast.framework.SessionProvider;
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.util.List;
+          import java.util.Locale;
+
+          /* App ID do Chromecast: vem do arquivo assets/cast_app.txt, que o GitHub cria a partir da variável CAST_APP_ID */
+          public class CastOptionsProvider implements OptionsProvider {
+            public static String appId(Context c) {
+              try (BufferedReader r = new BufferedReader(new InputStreamReader(c.getAssets().open("cast_app.txt")))) {
+                String s = r.readLine();
+                s = s == null ? "" : s.trim().toUpperCase(Locale.ROOT);
+                return s.matches("[A-F0-9]{8}") ? s : "";
+              } catch (Exception e) {
+                return "";
+              }
+            }
+
+            @Override
+            public CastOptions getCastOptions(Context context) {
+              String id = appId(context);
+              return new CastOptions.Builder().setReceiverApplicationId(id.isEmpty() ? "CC1AD845" : id).build();
+            }
+
+            @Override
+            public List<SessionProvider> getAdditionalSessionProviders(Context context) {
+              return null;
+            }
+          }
+          EOF
+
           # servidor Wi-Fi local (sem internet): serve o jogo e a sala online em http://IP:8380
           cat > app/src/main/java/com/newjazz/app/LanServer.java <<'EOF'
           package com.newjazz.app;
- 
+
           import java.io.*;
           import java.net.*;
           import java.nio.charset.StandardCharsets;
           import java.security.MessageDigest;
           import java.util.*;
           import java.util.concurrent.*;
- 
+
           /* Servidor Wi-Fi local do New Jazz: serve o jogo pela rede (http://IP:8380)
              e faz a sala online em ws://IP:8380/ws, com o mesmo protocolo do servidor da internet:
              cliente -> {t:'join',room} {t:'emit',topic,data} {t:'presence',patch}
              servidor -> {t:'joined',id} {t:'peers',peers:[{peer,presence}]} {t:'ev',topic,peer,data} {t:'err',code} */
           public class LanServer {
             public interface Files { InputStream open(String path) throws IOException; }
- 
+
             final int port; final Files files;
             ServerSocket ss; volatile boolean run;
             final ExecutorService pool = Executors.newCachedThreadPool();
             final Map<String, List<Client>> rooms = new HashMap<>();
             final Set<Client> all = Collections.newSetFromMap(new ConcurrentHashMap<Client, Boolean>());
             final Random rnd = new Random();
- 
+
             public LanServer(int port, Files files) { this.port = port; this.files = files; }
- 
+
             public synchronized void start() throws IOException {
               if (run) return;
               ss = new ServerSocket();
@@ -243,7 +420,7 @@ jobs:
               t.setDaemon(true);
               t.start();
             }
- 
+
             public synchronized void stop() {
               run = false;
               try { if (ss != null) ss.close(); } catch (IOException e) {}
@@ -251,10 +428,10 @@ jobs:
               all.clear();
               synchronized (rooms) { rooms.clear(); }
             }
- 
+
             public boolean running() { return run; }
             public int clients() { return all.size(); }
- 
+
             /* IPs IPv4 da rede local (Wi-Fi, roteador do celular, cabo) */
             public static List<String> ips() {
               List<String> wifi = new ArrayList<>(), other = new ArrayList<>();
@@ -273,7 +450,7 @@ jobs:
               wifi.addAll(other);
               return wifi;
             }
- 
+
             void loop() {
               while (run) {
                 try {
@@ -282,7 +459,7 @@ jobs:
                 } catch (IOException e) { if (!run) break; }
               }
             }
- 
+
             /* ---------------- HTTP ---------------- */
             static String readLine(InputStream in) throws IOException {
               StringBuilder sb = new StringBuilder();
@@ -294,7 +471,7 @@ jobs:
               }
               return sb.length() > 0 ? sb.toString() : null;
             }
- 
+
             void handle(Socket s) {
               try {
                 s.setTcpNoDelay(true);
@@ -320,7 +497,7 @@ jobs:
               } catch (Exception e) {
               } finally { try { s.close(); } catch (IOException e) {} }
             }
- 
+
             static String mime(String p) {
               String e = p.substring(p.lastIndexOf('.') + 1).toLowerCase(Locale.ROOT);
               switch (e) {
@@ -344,7 +521,7 @@ jobs:
                 default: return "application/octet-stream";
               }
             }
- 
+
             void head(OutputStream out, int code, String msg, String type, long len, boolean keep, String extra) throws IOException {
               StringBuilder sb = new StringBuilder();
               sb.append("HTTP/1.1 ").append(code).append(' ').append(msg).append("\r\n");
@@ -357,7 +534,7 @@ jobs:
               sb.append("\r\n");
               out.write(sb.toString().getBytes(StandardCharsets.ISO_8859_1));
             }
- 
+
             void serve(OutputStream out, String method, String target, Map<String, String> h, boolean keep) throws IOException {
               boolean isHead = "HEAD".equals(method);
               String path = target;
@@ -401,19 +578,19 @@ jobs:
                 }
               } finally { try { in.close(); } catch (IOException e) {} }
             }
- 
+
             static void chunk(OutputStream out, byte[] b, int n) throws IOException {
               out.write((Integer.toHexString(n) + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
               out.write(b, 0, n);
               out.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
             }
- 
+
             void text(OutputStream out, int code, String msg, String body, boolean keep, boolean isHead) throws IOException {
               byte[] b = body.getBytes(StandardCharsets.UTF_8);
               head(out, code, msg, "text/plain; charset=utf-8", b.length, keep, "Cache-Control: no-store\r\n");
               if (!isHead) out.write(b);
             }
- 
+
             /* ---------------- WebSocket ---------------- */
             static final String B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
             static String b64(byte[] d) {
@@ -426,7 +603,7 @@ jobs:
               }
               return sb.toString();
             }
- 
+
             class Client {
               final Socket s; final OutputStream out; String id; String room; Map<String, Object> pres = new LinkedHashMap<>();
               volatile boolean open = true;
@@ -442,9 +619,9 @@ jobs:
               }
               void close() { open = false; try { s.close(); } catch (IOException e) {} }
             }
- 
+
             static int rd(InputStream in) throws IOException { int c = in.read(); if (c < 0) throw new EOFException(); return c; }
- 
+
             void ws(Socket s, InputStream in, OutputStream out, Map<String, String> h) throws Exception {
               String key = h.get("sec-websocket-key");
               if (key == null) return;
@@ -486,7 +663,7 @@ jobs:
                 leave(c);
               }
             }
- 
+
             /* ---------------- salas ---------------- */
             void onMsg(Client c, String txt) {
               Object o;
@@ -527,11 +704,11 @@ jobs:
                 leave(c);
               }
             }
- 
+
             List<Client> snapshot(String room) {
               synchronized (rooms) { List<Client> l = rooms.get(room); return l == null ? new ArrayList<Client>() : new ArrayList<>(l); }
             }
- 
+
             void leave(Client c) {
               String r = c.room;
               if (r == null) return;
@@ -542,7 +719,7 @@ jobs:
               c.room = null;
               peersOut(r);
             }
- 
+
             void peersOut(String room) {
               List<Client> l = snapshot(room);
               StringBuilder sb = new StringBuilder("{\"t\":\"peers\",\"peers\":[");
@@ -558,7 +735,7 @@ jobs:
               String s = sb.toString();
               for (Client x : l) x.send(s);
             }
- 
+
             /* ---------------- JSON mínimo ---------------- */
             static class Json {
               final String s; int i;
@@ -651,9 +828,13 @@ jobs:
             }
           }
           EOF
- 
+
       - name: Colocar o jogo dentro do APK
+        env:
+          CAST_APP_ID: ${{ vars.CAST_APP_ID }}
         run: |
+          printf '%s' "$CAST_APP_ID" > proj/app/src/main/assets/cast_app.txt
+          if [ -n "$CAST_APP_ID" ]; then echo "Chromecast App ID: $CAST_APP_ID"; else echo "::warning::Sem CAST_APP_ID: o botao Chromecast do app vai pedir para configurar."; fi
           for z in NewJazz_*.zip; do unzip -q -o "$z" -d proj/app/src/main/assets/www; done
           W=proj/app/src/main/assets/www
           # se o zip tiver uma pasta extra por dentro, sobe o conteúdo
@@ -664,28 +845,70 @@ jobs:
           test -f $W/index.html
           cp $W/a/surf.webp proj/app/src/main/res/drawable/icone.webp
           echo "imagens: $(ls $W/a | wc -l) · radio: $(ls $W/radio 2>/dev/null | wc -l)"
- 
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
- 
+
       - name: Preparar Android SDK
         run: |
           SDKM=$(ls $ANDROID_HOME/cmdline-tools/*/bin/sdkmanager | head -1)
           yes | $SDKM --licenses > /dev/null || true
           $SDKM "platforms;android-34" "build-tools;34.0.0"
- 
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
- 
+
       - name: Compilar
         working-directory: proj
         run: gradle assembleDebug --no-daemon
- 
+
       - uses: actions/upload-artifact@v4
         with:
           name: NewJazz-APK
           path: proj/app/build/outputs/apk/debug/app-debug.apk
- 
+
+  # publica o jogo no GitHub Pages: link online + cast.html (o endereco que o Chromecast abre)
+  pages:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.dep.outputs.page_url }}
+    steps:
+      - name: Baixar o jogo da Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # aceita a Release com a tag "jogo", "game" ou, se nao achar, a mais recente
+          gh release download jogo --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --clobber \
+            || gh release download game --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --clobber \
+            || gh release download --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --clobber || true
+          ls NewJazz_*.zip
+
+      - name: Montar o site
+        run: |
+          mkdir -p site
+          for z in NewJazz_*.zip; do unzip -q -o "$z" -d site; done
+          if [ ! -f site/index.html ]; then
+            d=$(dirname "$(find site -name index.html | head -1)")
+            [ -n "$d" ] && cp -r "$d"/. site/
+          fi
+          test -f site/index.html
+          cp site/index.html site/cast.html
+          rm -f site/servidor_wifi.py site/*.bat site/*.sh
+          touch site/.nojekyll
+          du -sh site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: dep
+        uses: actions/deploy-pages@v4
