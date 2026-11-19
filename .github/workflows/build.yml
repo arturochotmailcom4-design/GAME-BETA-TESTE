@@ -11,23 +11,26 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-
+ 
       - name: Baixar o jogo da Release "jogo"
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download jogo --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --clobber || true
+          # aceita a Release com a tag "jogo", "game" ou, se nao achar, a mais recente
+          gh release download jogo --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --clobber \
+            || gh release download game --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --clobber \
+            || gh release download --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --clobber || true
           ls -la *.zip 2>/dev/null || true
           if ! ls NewJazz_*.zip >/dev/null 2>&1; then
-            echo "::error::Nao achei o NewJazz_completo.zip. Crie a Release com a tag 'jogo' e anexe o zip."
+            echo "::error::Nao achei o NewJazz_completo.zip. Crie uma Release (tag jogo ou game) e anexe o zip."
             exit 1
           fi
-
+ 
       - name: Criar o projeto Android
         run: |
           mkdir -p proj/app/src/main/java/com/newjazz/app proj/app/src/main/assets/www proj/app/src/main/res/drawable proj/app/src/main/res/values
           cd proj
-
+ 
           cat > settings.gradle <<'EOF'
           pluginManagement {
             repositories { google(); mavenCentral(); gradlePluginPortal() }
@@ -38,16 +41,16 @@ jobs:
           rootProject.name = "NewJazz"
           include ':app'
           EOF
-
+ 
           cat > build.gradle <<'EOF'
           plugins { id 'com.android.application' version '8.5.2' apply false }
           EOF
-
+ 
           cat > gradle.properties <<'EOF'
           org.gradle.jvmargs=-Xmx3g
           android.nonTransitiveRClass=true
           EOF
-
+ 
           cat > app/build.gradle <<'EOF'
           plugins { id 'com.android.application' }
           android {
@@ -57,8 +60,8 @@ jobs:
               applicationId 'com.newjazz.app'
               minSdk 24
               targetSdk 34
-              versionCode 402
-              versionName '402'
+              versionCode 487
+              versionName '487'
             }
             compileOptions {
               sourceCompatibility JavaVersion.VERSION_17
@@ -67,15 +70,18 @@ jobs:
             androidResources { noCompress += ['mp3', 'webp'] }
           }
           EOF
-
+ 
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
             <uses-permission android:name="android.permission.INTERNET" />
+            <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+            <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
             <application
               android:label="New Jazz"
               android:icon="@drawable/icone"
               android:hardwareAccelerated="true"
+              android:largeHeap="true"
               android:usesCleartextTraffic="true"
               android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
               <activity
@@ -90,21 +96,58 @@ jobs:
             </application>
           </manifest>
           EOF
-
+ 
           cat > app/src/main/java/com/newjazz/app/MainActivity.java <<'EOF'
           package com.newjazz.app;
-
+ 
           import android.app.Activity;
           import android.content.Intent;
           import android.net.Uri;
           import android.os.Bundle;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
-
+          import java.util.List;
+ 
           public class MainActivity extends Activity {
             WebView w;
-
+            static LanServer lan;
+            static final int LAN_PORT = 8380;
+ 
+            /* ponte do jogo: window.NJLocal.start() / stop() / info() */
+            class Bridge {
+              @JavascriptInterface
+              public String start() {
+                try {
+                  if (lan == null) lan = new LanServer(LAN_PORT, p -> getAssets().open("www/" + p));
+                  lan.start();
+                  runOnUiThread(() -> getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON));
+                  return info(true);
+                } catch (Exception e) {
+                  return "{\"ok\":false,\"err\":" + LanServer.Json.str(String.valueOf(e.getMessage())) + "}";
+                }
+              }
+ 
+              @JavascriptInterface
+              public void stop() {
+                if (lan != null) lan.stop();
+                runOnUiThread(() -> getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON));
+              }
+ 
+              @JavascriptInterface
+              public String info() { return info(lan != null && lan.running()); }
+ 
+              String info(boolean ok) {
+                StringBuilder sb = new StringBuilder("{\"ok\":").append(ok).append(",\"on\":").append(lan != null && lan.running());
+                sb.append(",\"port\":").append(LAN_PORT).append(",\"n\":").append(lan == null ? 0 : lan.clients()).append(",\"ips\":[");
+                List<String> ips = LanServer.ips();
+                for (int i = 0; i < ips.size(); i++) { if (i > 0) sb.append(','); sb.append(LanServer.Json.str(ips.get(i))); }
+                return sb.append("]}").toString();
+              }
+            }
+ 
             @Override
             protected void onCreate(Bundle b) {
               super.onCreate(b);
@@ -117,6 +160,7 @@ jobs:
               s.setAllowFileAccessFromFileURLs(true);
               s.setAllowUniversalAccessFromFileURLs(true);
               s.setMediaPlaybackRequiresUserGesture(false);
+              w.addJavascriptInterface(new Bridge(), "NJLocal");
               w.setWebViewClient(new WebViewClient() {
                 @Override
                 public boolean shouldOverrideUrlLoading(WebView v, String u) {
@@ -131,30 +175,482 @@ jobs:
               w.loadUrl("file:///android_asset/www/index.html");
               hide();
             }
-
+ 
             void hide() {
               getWindow().getDecorView().setSystemUiVisibility(4 | 2 | 4096 | 1024 | 512 | 256);
             }
-
+ 
             @Override
             public void onWindowFocusChanged(boolean f) {
               super.onWindowFocusChanged(f);
               if (f) hide();
             }
-
+ 
             @Override
             public void onBackPressed() {
               if (w.canGoBack()) w.goBack(); else super.onBackPressed();
             }
-
+ 
             @Override
             protected void onPause() { super.onPause(); w.onPause(); }
-
+ 
             @Override
             protected void onResume() { super.onResume(); w.onResume(); }
+ 
+            @Override
+            protected void onDestroy() {
+              if (isFinishing() && lan != null) { lan.stop(); lan = null; }
+              super.onDestroy();
+            }
           }
           EOF
-
+ 
+          # servidor Wi-Fi local (sem internet): serve o jogo e a sala online em http://IP:8380
+          cat > app/src/main/java/com/newjazz/app/LanServer.java <<'EOF'
+          package com.newjazz.app;
+ 
+          import java.io.*;
+          import java.net.*;
+          import java.nio.charset.StandardCharsets;
+          import java.security.MessageDigest;
+          import java.util.*;
+          import java.util.concurrent.*;
+ 
+          /* Servidor Wi-Fi local do New Jazz: serve o jogo pela rede (http://IP:8380)
+             e faz a sala online em ws://IP:8380/ws, com o mesmo protocolo do servidor da internet:
+             cliente -> {t:'join',room} {t:'emit',topic,data} {t:'presence',patch}
+             servidor -> {t:'joined',id} {t:'peers',peers:[{peer,presence}]} {t:'ev',topic,peer,data} {t:'err',code} */
+          public class LanServer {
+            public interface Files { InputStream open(String path) throws IOException; }
+ 
+            final int port; final Files files;
+            ServerSocket ss; volatile boolean run;
+            final ExecutorService pool = Executors.newCachedThreadPool();
+            final Map<String, List<Client>> rooms = new HashMap<>();
+            final Set<Client> all = Collections.newSetFromMap(new ConcurrentHashMap<Client, Boolean>());
+            final Random rnd = new Random();
+ 
+            public LanServer(int port, Files files) { this.port = port; this.files = files; }
+ 
+            public synchronized void start() throws IOException {
+              if (run) return;
+              ss = new ServerSocket();
+              ss.setReuseAddress(true);
+              ss.bind(new InetSocketAddress(port));
+              run = true;
+              Thread t = new Thread(this::loop, "nj-lan");
+              t.setDaemon(true);
+              t.start();
+            }
+ 
+            public synchronized void stop() {
+              run = false;
+              try { if (ss != null) ss.close(); } catch (IOException e) {}
+              for (Client c : all) c.close();
+              all.clear();
+              synchronized (rooms) { rooms.clear(); }
+            }
+ 
+            public boolean running() { return run; }
+            public int clients() { return all.size(); }
+ 
+            /* IPs IPv4 da rede local (Wi-Fi, roteador do celular, cabo) */
+            public static List<String> ips() {
+              List<String> wifi = new ArrayList<>(), other = new ArrayList<>();
+              try {
+                for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                  if (!ni.isUp() || ni.isLoopback()) continue;
+                  String n = ni.getName().toLowerCase();
+                  if (n.startsWith("rmnet") || n.startsWith("ccmni") || n.startsWith("tun") || n.startsWith("dummy") || n.startsWith("p2p")) continue;
+                  for (InetAddress a : Collections.list(ni.getInetAddresses())) {
+                    if (!(a instanceof Inet4Address) || a.isLoopbackAddress() || a.isLinkLocalAddress()) continue;
+                    String ip = a.getHostAddress();
+                    if (n.startsWith("wlan") || n.startsWith("ap") || n.startsWith("swlan") || n.startsWith("eth") || n.startsWith("en") || n.startsWith("wl")) wifi.add(ip); else other.add(ip);
+                  }
+                }
+              } catch (Exception e) {}
+              wifi.addAll(other);
+              return wifi;
+            }
+ 
+            void loop() {
+              while (run) {
+                try {
+                  final Socket s = ss.accept();
+                  pool.execute(() -> handle(s));
+                } catch (IOException e) { if (!run) break; }
+              }
+            }
+ 
+            /* ---------------- HTTP ---------------- */
+            static String readLine(InputStream in) throws IOException {
+              StringBuilder sb = new StringBuilder();
+              int c, n = 0;
+              while ((c = in.read()) != -1) {
+                if (c == '\n') return sb.toString();
+                if (c != '\r') sb.append((char) c);
+                if (++n > 8192) throw new IOException("linha grande");
+              }
+              return sb.length() > 0 ? sb.toString() : null;
+            }
+ 
+            void handle(Socket s) {
+              try {
+                s.setTcpNoDelay(true);
+                s.setSoTimeout(20000);
+                InputStream in = new BufferedInputStream(s.getInputStream());
+                OutputStream out = new BufferedOutputStream(s.getOutputStream(), 65536);
+                while (run) {
+                  String line = readLine(in);
+                  if (line == null || line.isEmpty()) break;
+                  String[] p = line.split(" ");
+                  Map<String, String> h = new HashMap<>();
+                  String l;
+                  while ((l = readLine(in)) != null && !l.isEmpty()) {
+                    int i = l.indexOf(':');
+                    if (i > 0) h.put(l.substring(0, i).trim().toLowerCase(Locale.ROOT), l.substring(i + 1).trim());
+                  }
+                  if ("websocket".equalsIgnoreCase(h.get("upgrade"))) { ws(s, in, out, h); return; }
+                  boolean keep = !"close".equalsIgnoreCase(h.get("connection"));
+                  serve(out, p[0], p.length > 1 ? p[1] : "/", h, keep);
+                  out.flush();
+                  if (!keep) break;
+                }
+              } catch (Exception e) {
+              } finally { try { s.close(); } catch (IOException e) {} }
+            }
+ 
+            static String mime(String p) {
+              String e = p.substring(p.lastIndexOf('.') + 1).toLowerCase(Locale.ROOT);
+              switch (e) {
+                case "html": case "htm": return "text/html; charset=utf-8";
+                case "js": return "application/javascript; charset=utf-8";
+                case "css": return "text/css; charset=utf-8";
+                case "json": return "application/json; charset=utf-8";
+                case "txt": return "text/plain; charset=utf-8";
+                case "webp": return "image/webp";
+                case "png": return "image/png";
+                case "jpg": case "jpeg": return "image/jpeg";
+                case "gif": return "image/gif";
+                case "svg": return "image/svg+xml";
+                case "mp3": return "audio/mpeg";
+                case "ogg": return "audio/ogg";
+                case "wav": return "audio/wav";
+                case "mp4": return "video/mp4";
+                case "webm": return "video/webm";
+                case "woff2": return "font/woff2";
+                case "ico": return "image/x-icon";
+                default: return "application/octet-stream";
+              }
+            }
+ 
+            void head(OutputStream out, int code, String msg, String type, long len, boolean keep, String extra) throws IOException {
+              StringBuilder sb = new StringBuilder();
+              sb.append("HTTP/1.1 ").append(code).append(' ').append(msg).append("\r\n");
+              sb.append("Content-Type: ").append(type).append("\r\n");
+              if (len >= 0) sb.append("Content-Length: ").append(len).append("\r\n");
+              else sb.append("Transfer-Encoding: chunked\r\n");
+              sb.append("Access-Control-Allow-Origin: *\r\n");
+              sb.append("Connection: ").append(keep ? "keep-alive" : "close").append("\r\n");
+              if (extra != null) sb.append(extra);
+              sb.append("\r\n");
+              out.write(sb.toString().getBytes(StandardCharsets.ISO_8859_1));
+            }
+ 
+            void serve(OutputStream out, String method, String target, Map<String, String> h, boolean keep) throws IOException {
+              boolean isHead = "HEAD".equals(method);
+              String path = target;
+              int q = path.indexOf('?'); if (q >= 0) path = path.substring(0, q);
+              int f = path.indexOf('#'); if (f >= 0) path = path.substring(0, f);
+              try { path = URLDecoder.decode(path.replace("+", "%2B"), "UTF-8"); } catch (Exception e) {}
+              while (path.startsWith("/")) path = path.substring(1);
+              if (path.isEmpty()) path = "index.html";
+              if (path.contains("..") || path.contains("\\") || path.contains("\0")) { text(out, 403, "Proibido", "proibido", keep, isHead); return; }
+              if (path.equals("a/config.js")) {
+                String host = h.get("host");
+                if (host == null || !host.matches("[A-Za-z0-9.\\-:\\[\\]]{1,80}")) host = "127.0.0.1:" + port;
+                String js = "window.NJ_SERVER='ws://" + host + "/ws';window.NJ_LAN=1;window.NJ_LAN_HOST='" + host + "';\n";
+                byte[] b = js.getBytes(StandardCharsets.UTF_8);
+                head(out, 200, "OK", "application/javascript; charset=utf-8", b.length, keep, "Cache-Control: no-store\r\n");
+                if (!isHead) out.write(b);
+                return;
+              }
+              if (path.equals("nj-lan")) { text(out, 200, "OK", "newjazz-lan", keep, isHead); return; }
+              InputStream in;
+              try { in = files.open(path); } catch (IOException e) { in = null; }
+              if (in == null) { text(out, 404, "Nao encontrado", "nao encontrado: " + path, keep, isHead); return; }
+              try {
+                String type = mime(path);
+                String cache = path.startsWith("a/") || path.startsWith("radio/") || path.startsWith("voz/") ? "Cache-Control: max-age=86400\r\n" : "Cache-Control: no-cache\r\n";
+                /* lê até 8 MB na memória (com tamanho certo); maior que isso vai em pedaços */
+                ByteArrayOutputStream buf = new ByteArrayOutputStream();
+                byte[] b = new byte[65536];
+                int n; boolean big = false;
+                while ((n = in.read(b)) > 0) { buf.write(b, 0, n); if (buf.size() > 8 * 1024 * 1024) { big = true; break; } }
+                if (!big) {
+                  head(out, 200, "OK", type, buf.size(), keep, cache);
+                  if (!isHead) buf.writeTo(out);
+                } else {
+                  head(out, 200, "OK", type, -1, keep, cache);
+                  if (!isHead) {
+                    chunk(out, buf.toByteArray(), buf.size());
+                    while ((n = in.read(b)) > 0) chunk(out, b, n);
+                    out.write("0\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+                  } else out.write("0\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+                }
+              } finally { try { in.close(); } catch (IOException e) {} }
+            }
+ 
+            static void chunk(OutputStream out, byte[] b, int n) throws IOException {
+              out.write((Integer.toHexString(n) + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
+              out.write(b, 0, n);
+              out.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+            }
+ 
+            void text(OutputStream out, int code, String msg, String body, boolean keep, boolean isHead) throws IOException {
+              byte[] b = body.getBytes(StandardCharsets.UTF_8);
+              head(out, code, msg, "text/plain; charset=utf-8", b.length, keep, "Cache-Control: no-store\r\n");
+              if (!isHead) out.write(b);
+            }
+ 
+            /* ---------------- WebSocket ---------------- */
+            static final String B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            static String b64(byte[] d) {
+              StringBuilder sb = new StringBuilder();
+              for (int i = 0; i < d.length; i += 3) {
+                int b0 = d[i] & 255, b1 = i + 1 < d.length ? d[i + 1] & 255 : 0, b2 = i + 2 < d.length ? d[i + 2] & 255 : 0;
+                sb.append(B64.charAt(b0 >> 2)).append(B64.charAt(((b0 & 3) << 4) | (b1 >> 4)));
+                sb.append(i + 1 < d.length ? B64.charAt(((b1 & 15) << 2) | (b2 >> 6)) : '=');
+                sb.append(i + 2 < d.length ? B64.charAt(b2 & 63) : '=');
+              }
+              return sb.toString();
+            }
+ 
+            class Client {
+              final Socket s; final OutputStream out; String id; String room; Map<String, Object> pres = new LinkedHashMap<>();
+              volatile boolean open = true;
+              Client(Socket s, OutputStream out) { this.s = s; this.out = out; }
+              void send(String txt) { if (!open) return; try { frame(1, txt.getBytes(StandardCharsets.UTF_8)); } catch (IOException e) { close(); } }
+              synchronized void frame(int op, byte[] p) throws IOException {
+                out.write(0x80 | op);
+                if (p.length < 126) out.write(p.length);
+                else if (p.length < 65536) { out.write(126); out.write(p.length >> 8); out.write(p.length & 255); }
+                else { out.write(127); for (int i = 7; i >= 0; i--) out.write((int) (((long) p.length >> (8 * i)) & 255)); }
+                out.write(p);
+                out.flush();
+              }
+              void close() { open = false; try { s.close(); } catch (IOException e) {} }
+            }
+ 
+            static int rd(InputStream in) throws IOException { int c = in.read(); if (c < 0) throw new EOFException(); return c; }
+ 
+            void ws(Socket s, InputStream in, OutputStream out, Map<String, String> h) throws Exception {
+              String key = h.get("sec-websocket-key");
+              if (key == null) return;
+              MessageDigest md = MessageDigest.getInstance("SHA-1");
+              String acc = b64(md.digest((key.trim() + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").getBytes(StandardCharsets.ISO_8859_1)));
+              out.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + acc + "\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
+              out.flush();
+              s.setSoTimeout(0);
+              Client c = new Client(s, out);
+              all.add(c);
+              ByteArrayOutputStream msg = new ByteArrayOutputStream();
+              try {
+                while (run && c.open) {
+                  int b0 = rd(in), b1 = rd(in);
+                  int op = b0 & 15; boolean fin = (b0 & 128) != 0, masked = (b1 & 128) != 0;
+                  long len = b1 & 127;
+                  if (len == 126) len = (rd(in) << 8) | rd(in);
+                  else if (len == 127) { len = 0; for (int i = 0; i < 8; i++) len = (len << 8) | rd(in); }
+                  if (len > 2 * 1024 * 1024) break;
+                  byte[] mk = new byte[4];
+                  if (masked) for (int i = 0; i < 4; i++) mk[i] = (byte) rd(in);
+                  byte[] p = new byte[(int) len];
+                  int got = 0;
+                  while (got < len) { int n = in.read(p, got, (int) len - got); if (n < 0) throw new EOFException(); got += n; }
+                  if (masked) for (int i = 0; i < p.length; i++) p[i] ^= mk[i & 3];
+                  if (op == 8) { try { c.frame(8, new byte[0]); } catch (IOException e) {} break; }
+                  if (op == 9) { c.frame(10, p); continue; }
+                  if (op == 10) continue;
+                  if (op == 1 || op == 2 || op == 0) {
+                    msg.write(p);
+                    if (msg.size() > 2 * 1024 * 1024) break;
+                    if (fin) { String t = new String(msg.toByteArray(), StandardCharsets.UTF_8); msg.reset(); onMsg(c, t); }
+                  }
+                }
+              } catch (Exception e) {
+              } finally {
+                c.close();
+                all.remove(c);
+                leave(c);
+              }
+            }
+ 
+            /* ---------------- salas ---------------- */
+            void onMsg(Client c, String txt) {
+              Object o;
+              try { o = Json.parse(txt); } catch (Exception e) { return; }
+              if (!(o instanceof Map)) return;
+              @SuppressWarnings("unchecked") Map<String, Object> m = (Map<String, Object>) o;
+              Object t = m.get("t");
+              if ("join".equals(t)) {
+                Object r = m.get("room");
+                if (!(r instanceof String) || ((String) r).isEmpty() || ((String) r).length() > 80) { c.send("{\"t\":\"err\",\"code\":\"sala\"}"); return; }
+                if (c.room != null) return;
+                List<Client> peers;
+                synchronized (rooms) {
+                  peers = rooms.get(r);
+                  if (peers == null) { peers = new ArrayList<>(); rooms.put((String) r, peers); }
+                  if (peers.size() >= 16) { c.send("{\"t\":\"err\",\"code\":\"cheia\"}"); return; }
+                  c.id = "lan" + Integer.toString(100000 + rnd.nextInt(900000), 36) + Integer.toString(rnd.nextInt(1 << 20), 36);
+                  c.room = (String) r;
+                  peers.add(c);
+                }
+                c.send("{\"t\":\"joined\",\"id\":" + Json.str(c.id) + "}");
+                peersOut(c.room);
+              } else if ("emit".equals(t)) {
+                if (c.room == null) return;
+                Object topic = m.get("topic");
+                if (!(topic instanceof String)) return;
+                String ev = "{\"t\":\"ev\",\"topic\":" + Json.str((String) topic) + ",\"peer\":" + Json.str(c.id) + ",\"data\":" + Json.write(m.get("data")) + "}";
+                for (Client x : snapshot(c.room)) x.send(ev);
+              } else if ("presence".equals(t)) {
+                if (c.room == null) return;
+                Object p = m.get("patch");
+                if (p instanceof Map) {
+                  @SuppressWarnings("unchecked") Map<String, Object> pm = (Map<String, Object>) p;
+                  synchronized (c) { c.pres.putAll(pm); }
+                  peersOut(c.room);
+                }
+              } else if ("leave".equals(t)) {
+                leave(c);
+              }
+            }
+ 
+            List<Client> snapshot(String room) {
+              synchronized (rooms) { List<Client> l = rooms.get(room); return l == null ? new ArrayList<Client>() : new ArrayList<>(l); }
+            }
+ 
+            void leave(Client c) {
+              String r = c.room;
+              if (r == null) return;
+              synchronized (rooms) {
+                List<Client> l = rooms.get(r);
+                if (l != null) { l.remove(c); if (l.isEmpty()) rooms.remove(r); }
+              }
+              c.room = null;
+              peersOut(r);
+            }
+ 
+            void peersOut(String room) {
+              List<Client> l = snapshot(room);
+              StringBuilder sb = new StringBuilder("{\"t\":\"peers\",\"peers\":[");
+              boolean first = true;
+              for (Client x : l) {
+                if (!first) sb.append(',');
+                first = false;
+                String pres;
+                synchronized (x) { pres = Json.write(x.pres); }
+                sb.append("{\"peer\":").append(Json.str(x.id)).append(",\"presence\":").append(pres).append('}');
+              }
+              sb.append("]}");
+              String s = sb.toString();
+              for (Client x : l) x.send(s);
+            }
+ 
+            /* ---------------- JSON mínimo ---------------- */
+            static class Json {
+              final String s; int i;
+              Json(String s) { this.s = s; }
+              static Object parse(String s) { Json j = new Json(s); Object o = j.val(); j.ws(); if (j.i != s.length()) throw new RuntimeException("sobra"); return o; }
+              void ws() { while (i < s.length() && " \t\r\n".indexOf(s.charAt(i)) >= 0) i++; }
+              Object val() {
+                ws();
+                if (i >= s.length()) throw new RuntimeException("fim");
+                char c = s.charAt(i);
+                if (c == '{') {
+                  i++; Map<String, Object> m = new LinkedHashMap<>(); ws();
+                  if (s.charAt(i) == '}') { i++; return m; }
+                  while (true) {
+                    ws(); String k = strv(); ws();
+                    if (s.charAt(i++) != ':') throw new RuntimeException(":");
+                    m.put(k, val()); ws();
+                    char d = s.charAt(i++);
+                    if (d == '}') return m;
+                    if (d != ',') throw new RuntimeException(",");
+                  }
+                }
+                if (c == '[') {
+                  i++; List<Object> l = new ArrayList<>(); ws();
+                  if (s.charAt(i) == ']') { i++; return l; }
+                  while (true) {
+                    l.add(val()); ws();
+                    char d = s.charAt(i++);
+                    if (d == ']') return l;
+                    if (d != ',') throw new RuntimeException(",");
+                  }
+                }
+                if (c == '"') return strv();
+                if (s.startsWith("true", i)) { i += 4; return Boolean.TRUE; }
+                if (s.startsWith("false", i)) { i += 5; return Boolean.FALSE; }
+                if (s.startsWith("null", i)) { i += 4; return null; }
+                int st = i;
+                while (i < s.length() && "+-0123456789.eE".indexOf(s.charAt(i)) >= 0) i++;
+                if (st == i) throw new RuntimeException("valor");
+                return new Num(s.substring(st, i));
+              }
+              String strv() {
+                if (s.charAt(i) != '"') throw new RuntimeException("\"");
+                i++; StringBuilder sb = new StringBuilder();
+                while (true) {
+                  char c = s.charAt(i++);
+                  if (c == '"') return sb.toString();
+                  if (c == '\\') {
+                    char e = s.charAt(i++);
+                    switch (e) {
+                      case 'n': sb.append('\n'); break; case 't': sb.append('\t'); break; case 'r': sb.append('\r'); break;
+                      case 'b': sb.append('\b'); break; case 'f': sb.append('\f'); break;
+                      case 'u': sb.append((char) Integer.parseInt(s.substring(i, i + 4), 16)); i += 4; break;
+                      default: sb.append(e);
+                    }
+                  } else sb.append(c);
+                }
+              }
+              /* número guardado como texto: volta igualzinho */
+              static class Num { final String v; Num(String v) { this.v = v; } public String toString() { return v; } }
+              static String str(String v) {
+                StringBuilder sb = new StringBuilder("\"");
+                for (int k = 0; k < v.length(); k++) {
+                  char c = v.charAt(k);
+                  if (c == '"' || c == '\\') sb.append('\\').append(c);
+                  else if (c < 32 || c == 0x2028 || c == 0x2029) sb.append(String.format("\\u%04x", (int) c));
+                  else sb.append(c);
+                }
+                return sb.append('"').toString();
+              }
+              static String write(Object o) {
+                if (o == null) return "null";
+                if (o instanceof String) return str((String) o);
+                if (o instanceof Num || o instanceof Boolean) return o.toString();
+                if (o instanceof Map) {
+                  StringBuilder sb = new StringBuilder("{"); boolean f = true;
+                  for (Map.Entry<?, ?> e : ((Map<?, ?>) o).entrySet()) {
+                    if (!f) sb.append(','); f = false;
+                    sb.append(str(String.valueOf(e.getKey()))).append(':').append(write(e.getValue()));
+                  }
+                  return sb.append('}').toString();
+                }
+                if (o instanceof List) {
+                  StringBuilder sb = new StringBuilder("["); boolean f = true;
+                  for (Object e : (List<?>) o) { if (!f) sb.append(','); f = false; sb.append(write(e)); }
+                  return sb.append(']').toString();
+                }
+                return str(o.toString());
+              }
+            }
+          }
+          EOF
+ 
       - name: Colocar o jogo dentro do APK
         run: |
           for z in NewJazz_*.zip; do unzip -q -o "$z" -d proj/app/src/main/assets/www; done
@@ -167,27 +663,28 @@ jobs:
           test -f $W/index.html
           cp $W/a/surf.webp proj/app/src/main/res/drawable/icone.webp
           echo "imagens: $(ls $W/a | wc -l) · radio: $(ls $W/radio 2>/dev/null | wc -l)"
-
+ 
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-
+ 
       - name: Preparar Android SDK
         run: |
           SDKM=$(ls $ANDROID_HOME/cmdline-tools/*/bin/sdkmanager | head -1)
           yes | $SDKM --licenses > /dev/null || true
           $SDKM "platforms;android-34" "build-tools;34.0.0"
-
+ 
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-
+ 
       - name: Compilar
         working-directory: proj
         run: gradle assembleDebug --no-daemon
-
+ 
       - uses: actions/upload-artifact@v4
         with:
           name: NewJazz-APK
           path: proj/app/build/outputs/apk/debug/app-debug.apk
+ 
